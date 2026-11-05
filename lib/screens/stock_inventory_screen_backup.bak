@@ -1,0 +1,792 @@
+import 'dart:async';
+
+import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../models/stock_item.dart';
+import '../services/stock_service.dart';
+import '../utils/stock_filter.dart';
+
+class StockInventoryScreen extends StatefulWidget {
+  const StockInventoryScreen({super.key});
+
+  @override
+  State<StockInventoryScreen> createState() => _StockInventoryScreenState();
+}
+
+class _StockInventoryScreenState extends State<StockInventoryScreen>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
+  final StockService _stockService = StockService();
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  void _showInventoryAfterSave() => _tabController.animateTo(0);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Stock Inventory Manager'),
+        centerTitle: false,
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(icon: Icon(Icons.inventory_2_outlined), text: 'Inventory'),
+            Tab(icon: Icon(Icons.add_box_outlined), text: 'Add Item'),
+          ],
+        ),
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          _InventoryTab(stockService: _stockService),
+          _StockEntryForm(
+            stockService: _stockService,
+            onSaved: _showInventoryAfterSave,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Task 1 + 2: entry form, validation and Firestore save
+// ---------------------------------------------------------------------------
+
+class _UpperCaseFormatter extends TextInputFormatter {
+  @override
+  TextEditingValue formatEditUpdate(
+    TextEditingValue oldValue,
+    TextEditingValue newValue,
+  ) => newValue.copyWith(text: newValue.text.toUpperCase());
+}
+
+class _StockEntryForm extends StatefulWidget {
+  const _StockEntryForm({required this.stockService, required this.onSaved});
+
+  final StockService stockService;
+  final VoidCallback onSaved;
+
+  @override
+  State<_StockEntryForm> createState() => _StockEntryFormState();
+}
+
+class _StockEntryFormState extends State<_StockEntryForm>
+    with AutomaticKeepAliveClientMixin {
+  GlobalKey<FormState> _formKey = GlobalKey<FormState>();
+
+  final TextEditingController _skuController = TextEditingController();
+  final TextEditingController _nameController = TextEditingController();
+  final TextEditingController _quantityController = TextEditingController();
+  final TextEditingController _priceController = TextEditingController();
+  final TextEditingController _reorderController = TextEditingController();
+
+  String? _selectedCategory;
+  bool _isSaving = false;
+
+  /// SKU that Firestore reported as already in use (shown as a field error).
+  String? _duplicateSku;
+
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  void dispose() {
+    _skuController.dispose();
+    _nameController.dispose();
+    _quantityController.dispose();
+    _priceController.dispose();
+    _reorderController.dispose();
+    super.dispose();
+  }
+
+  // ----- validators -----
+
+  String? _validateSku(String? value) {
+    final sku = value?.trim() ?? '';
+    if (sku.isEmpty) return 'Enter an SKU, for example STK-101.';
+    if (!RegExp(r'^STK-\d{3}$').hasMatch(sku)) {
+      return 'Use the format STK- followed by exactly three digits.';
+    }
+    if (_duplicateSku != null && sku == _duplicateSku) {
+      return 'SKU $sku already exists in the inventory.';
+    }
+    return null;
+  }
+
+  String? _validateName(String? value) {
+    final name = value?.trim() ?? '';
+    if (name.isEmpty) return 'Enter an item name.';
+    if (name.length < 3) return 'Item name must contain at least 3 characters.';
+    return null;
+  }
+
+  String? _validateWholeNumber(String? value, String label) {
+    final text = value?.trim() ?? '';
+    if (text.isEmpty) return '$label is required.';
+    final number = int.tryParse(text);
+    if (number == null) return '$label must be a whole number (no decimals).';
+    if (number < 0) return '$label cannot be negative.';
+    return null;
+  }
+
+  String? _validatePrice(String? value) {
+    final text = value?.trim() ?? '';
+    if (text.isEmpty) return 'Enter the unit price.';
+    final price = double.tryParse(text);
+    if (price == null || !price.isFinite) {
+      return 'Enter a valid price, such as 19.90.';
+    }
+    if (price <= 0) return 'Price must be greater than RM 0.00.';
+    return null;
+  }
+
+  // ----- save -----
+
+  void _showMessage(String message, {bool isError = false}) {
+    final scheme = Theme.of(context).colorScheme;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: isError ? scheme.errorContainer : null,
+          content: Text(
+            message,
+            style: isError ? TextStyle(color: scheme.onErrorContainer) : null,
+          ),
+        ),
+      );
+  }
+
+  Future<void> _saveItem() async {
+    // Validation gate: nothing is written to Firestore unless every field
+    // passes (including the category selector's validator).
+    final form = _formKey.currentState;
+    if (form == null || !form.validate()) return;
+
+    FocusScope.of(context).unfocus();
+    setState(() => _isSaving = true);
+
+    try {
+      await widget.stockService.addStockItem(
+        sku: _skuController.text.trim(),
+        itemName: _nameController.text.trim(),
+        category: _selectedCategory!,
+        quantity: int.parse(_quantityController.text.trim()),
+        unitPrice: double.parse(_priceController.text.trim()),
+        reorderLevel: int.parse(_reorderController.text.trim()),
+      );
+
+      if (!mounted) return;
+
+      // Clear only after Firestore acknowledges the write.
+      _skuController.clear();
+      _nameController.clear();
+      _quantityController.clear();
+      _priceController.clear();
+      _reorderController.clear();
+      setState(() {
+        _selectedCategory = null;
+        _duplicateSku = null;
+        _isSaving = false;
+        // New key recreates the Form so the category selector resets too.
+        _formKey = GlobalKey<FormState>();
+      });
+
+      _showMessage('Stock item saved successfully.');
+      widget.onSaved();
+    } on DuplicateSkuException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isSaving = false;
+        _duplicateSku = error.sku;
+      });
+      _formKey.currentState?.validate(); // show the inline SKU error
+      _showMessage(
+        'Nothing was saved: SKU ${error.sku} already exists.',
+        isError: true,
+      );
+    } on TimeoutException {
+      if (!mounted) return;
+      setState(() => _isSaving = false);
+      _showMessage(
+        'No confirmation from Firestore. Check your connection and try '
+        'again. Your form data is still here.',
+        isError: true,
+      );
+    } on FirebaseException catch (error) {
+      if (!mounted) return;
+      setState(() => _isSaving = false);
+      _showMessage(
+        'Could not save item (${error.code}). Your form data is still here.',
+        isError: true,
+      );
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _isSaving = false);
+      _showMessage(
+        'An unexpected error occurred. Your form data is still here.',
+        isError: true,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context); // required by AutomaticKeepAliveClientMixin
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(20),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 680),
+          child: Card(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Form(
+                key: _formKey,
+                autovalidateMode: AutovalidateMode.onUserInteraction,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      'Add a stock item',
+                      style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'All six fields are required. The item is stored in Cloud Firestore.',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                    const SizedBox(height: 22),
+                    TextFormField(
+                      controller: _skuController,
+                      enabled: !_isSaving,
+                      textInputAction: TextInputAction.next,
+                      textCapitalization: TextCapitalization.characters,
+                      inputFormatters: [_UpperCaseFormatter()],
+                      decoration: const InputDecoration(
+                        labelText: 'SKU',
+                        hintText: 'STK-101',
+                        prefixIcon: Icon(Icons.qr_code_2),
+                      ),
+                      validator: _validateSku,
+                    ),
+                    const SizedBox(height: 16),
+                    TextFormField(
+                      controller: _nameController,
+                      enabled: !_isSaving,
+                      textInputAction: TextInputAction.next,
+                      textCapitalization: TextCapitalization.words,
+                      decoration: const InputDecoration(
+                        labelText: 'Item name',
+                        hintText: 'USB C Cable',
+                        prefixIcon: Icon(Icons.inventory_2_outlined),
+                      ),
+                      validator: _validateName,
+                    ),
+                    const SizedBox(height: 16),
+                    DropdownButtonFormField<String>(
+                      // ignore: deprecated_member_use
+                      value: _selectedCategory,
+                      decoration: const InputDecoration(
+                        labelText: 'Category',
+                        prefixIcon: Icon(Icons.category_outlined),
+                      ),
+                      items: stockCategories
+                          .map(
+                            (category) => DropdownMenuItem<String>(
+                              value: category,
+                              child: Text(category),
+                            ),
+                          )
+                          .toList(),
+                      onChanged: _isSaving
+                          ? null
+                          : (value) =>
+                                setState(() => _selectedCategory = value),
+                      validator: (value) =>
+                          value == null ? 'Select a category.' : null,
+                    ),
+                    const SizedBox(height: 16),
+                    TextFormField(
+                      controller: _quantityController,
+                      enabled: !_isSaving,
+                      textInputAction: TextInputAction.next,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        signed: true,
+                      ),
+                      decoration: const InputDecoration(
+                        labelText: 'Quantity',
+                        hintText: '4',
+                        prefixIcon: Icon(Icons.numbers),
+                      ),
+                      validator: (value) =>
+                          _validateWholeNumber(value, 'Quantity'),
+                    ),
+                    const SizedBox(height: 16),
+                    TextFormField(
+                      controller: _priceController,
+                      enabled: !_isSaving,
+                      textInputAction: TextInputAction.next,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      decoration: const InputDecoration(
+                        labelText: 'Unit price (RM)',
+                        hintText: '19.90',
+                        prefixIcon: Icon(Icons.payments_outlined),
+                      ),
+                      validator: _validatePrice,
+                    ),
+                    const SizedBox(height: 16),
+                    TextFormField(
+                      controller: _reorderController,
+                      enabled: !_isSaving,
+                      textInputAction: TextInputAction.done,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        signed: true,
+                      ),
+                      decoration: const InputDecoration(
+                        labelText: 'Reorder level',
+                        hintText: '5',
+                        prefixIcon: Icon(Icons.notifications_active_outlined),
+                      ),
+                      validator: (value) =>
+                          _validateWholeNumber(value, 'Reorder level'),
+                      onFieldSubmitted: (_) {
+                        if (!_isSaving) _saveItem();
+                      },
+                    ),
+                    const SizedBox(height: 24),
+                    FilledButton.icon(
+                      onPressed: _isSaving ? null : _saveItem,
+                      icon: _isSaving
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.save_outlined),
+                      label: Text(_isSaving ? 'Saving...' : 'Save Item'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Task 2 + 3 + 5: Firestore inventory list with advanced search
+// ---------------------------------------------------------------------------
+
+class _InventoryTab extends StatefulWidget {
+  const _InventoryTab({required this.stockService});
+
+  final StockService stockService;
+
+  @override
+  State<_InventoryTab> createState() => _InventoryTabState();
+}
+
+class _InventoryTabState extends State<_InventoryTab>
+    with AutomaticKeepAliveClientMixin {
+  final TextEditingController _searchController = TextEditingController();
+
+  String _selectedCategory = 'All';
+  bool _lowStockOnly = false;
+  QuantitySort _quantitySort = QuantitySort.newest;
+
+  late Stream<List<StockItem>> _stockItemsStream;
+
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  void initState() {
+    super.initState();
+    _stockItemsStream = widget.stockService.watchStockItems();
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  bool get _hasActiveFilters =>
+      _searchController.text.trim().isNotEmpty ||
+      _selectedCategory != 'All' ||
+      _lowStockOnly ||
+      _quantitySort != QuantitySort.newest;
+
+  void _clearFilters() {
+    _searchController.clear();
+    setState(() {
+      _selectedCategory = 'All';
+      _lowStockOnly = false;
+      _quantitySort = QuantitySort.newest;
+    });
+  }
+
+  void _reloadStream() {
+    setState(() => _stockItemsStream = widget.stockService.watchStockItems());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context); // required by AutomaticKeepAliveClientMixin
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          TextField(
+            controller: _searchController,
+            onChanged: (_) => setState(() {}),
+            decoration: InputDecoration(
+              labelText: 'Search by item name or SKU',
+              hintText: 'For example, mouse or STK-102',
+              prefixIcon: const Icon(Icons.search),
+              suffixIcon: _searchController.text.isEmpty
+                  ? null
+                  : IconButton(
+                      tooltip: 'Clear keyword',
+                      onPressed: () {
+                        _searchController.clear();
+                        setState(() {});
+                      },
+                      icon: const Icon(Icons.close),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 12,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              _buildCategorySelector(),
+              _buildSortSelector(),
+              FilterChip(
+                label: const Text('Low stock only'),
+                avatar: const Icon(Icons.warning_amber_rounded, size: 18),
+                selected: _lowStockOnly,
+                onSelected: (selected) =>
+                    setState(() => _lowStockOnly = selected),
+              ),
+              TextButton.icon(
+                onPressed: _hasActiveFilters ? _clearFilters : null,
+                icon: const Icon(Icons.filter_alt_off),
+                label: const Text('Clear Filters'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: StreamBuilder<List<StockItem>>(
+              stream: _stockItemsStream,
+              builder: (context, snapshot) {
+                if (snapshot.hasError) {
+                  return _InventoryMessage(
+                    icon: Icons.cloud_off_outlined,
+                    title: 'Could not load inventory',
+                    message: 'Check your internet connection and Firestore access, then try again.',
+                    action: FilledButton.tonalIcon(
+                      onPressed: _reloadStream,
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Retry'),
+                    ),
+                  );
+                }
+
+                if (snapshot.connectionState == ConnectionState.waiting &&
+                    !snapshot.hasData) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+
+                final savedItems = snapshot.data ?? const <StockItem>[];
+                if (savedItems.isEmpty) {
+                  return const _InventoryMessage(
+                    icon: Icons.inventory_2_outlined,
+                    title: 'No stock items yet',
+                    message: 'Use the Add Item tab to save your first record.',
+                  );
+                }
+
+                final visibleItems = filterAndSortStock(
+                  savedItems,
+                  keyword: _searchController.text,
+                  category: _selectedCategory,
+                  lowStockOnly: _lowStockOnly,
+                  sort: _quantitySort,
+                );
+
+                if (visibleItems.isEmpty) {
+                  return _InventoryMessage(
+                    icon: Icons.search_off,
+                    title: 'No matching items',
+                    message:
+                        'No saved item matches all of the active filters. '
+                        'Try another keyword or clear one or more filters.',
+                    action: OutlinedButton.icon(
+                      onPressed: _clearFilters,
+                      icon: const Icon(Icons.filter_alt_off),
+                      label: const Text('Clear Filters'),
+                    ),
+                  );
+                }
+
+                final lowCount = savedItems.where((i) => i.isLowStock).length;
+
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text(
+                        'Showing ${visibleItems.length} of ${savedItems.length} '
+                        'item(s)  •  $lowCount low stock',
+                        style: Theme.of(context).textTheme.labelLarge,
+                      ),
+                    ),
+                    Expanded(
+                      child: ListView.separated(
+                        itemCount: visibleItems.length,
+                        separatorBuilder: (_, __) => const SizedBox(height: 8),
+                        itemBuilder: (context, index) =>
+                            _StockItemCard(item: visibleItems[index]),
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCategorySelector() {
+    return SizedBox(
+      width: 190,
+      child: InputDecorator(
+        decoration: const InputDecoration(
+          labelText: 'Category',
+          contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          border: OutlineInputBorder(),
+        ),
+        child: DropdownButtonHideUnderline(
+          child: DropdownButton<String>(
+            value: _selectedCategory,
+            isDense: true,
+            isExpanded: true,
+            items: ['All', ...stockCategories]
+                .map(
+                  (category) => DropdownMenuItem<String>(
+                    value: category,
+                    child: Text(category),
+                  ),
+                )
+                .toList(),
+            onChanged: (value) {
+              if (value != null) setState(() => _selectedCategory = value);
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSortSelector() {
+    return SizedBox(
+      width: 180,
+      child: InputDecorator(
+        decoration: const InputDecoration(
+          labelText: 'Sort quantity',
+          contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          border: OutlineInputBorder(),
+        ),
+        child: DropdownButtonHideUnderline(
+          child: DropdownButton<QuantitySort>(
+            value: _quantitySort,
+            isDense: true,
+            isExpanded: true,
+            items: const [
+              DropdownMenuItem(
+                value: QuantitySort.newest,
+                child: Text('Newest first'),
+              ),
+              DropdownMenuItem(
+                value: QuantitySort.ascending,
+                child: Text('Low to high'),
+              ),
+              DropdownMenuItem(
+                value: QuantitySort.descending,
+                child: Text('High to low'),
+              ),
+            ],
+            onChanged: (value) {
+              if (value != null) setState(() => _quantitySort = value);
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Presentation widgets
+// ---------------------------------------------------------------------------
+
+class _StockItemCard extends StatelessWidget {
+  const _StockItemCard({required this.item});
+
+  final StockItem item;
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Text(item.itemName, style: textTheme.titleMedium),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'RM ${item.unitPrice.toStringAsFixed(2)}',
+                  style: textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              children: [
+                _InfoChip(label: item.sku),
+                _InfoChip(label: item.category),
+                if (item.isLowStock)
+                  const _InfoChip(
+                    label: 'Low stock',
+                    icon: Icons.warning_amber_rounded,
+                    highlight: true,
+                  ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'Quantity: ${item.quantity}     Reorder level: ${item.reorderLevel}',
+              style: textTheme.bodyMedium,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _InfoChip extends StatelessWidget {
+  const _InfoChip({required this.label, this.icon, this.highlight = false});
+
+  final String label;
+  final IconData? icon;
+  final bool highlight;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+
+    return Chip(
+      visualDensity: VisualDensity.compact,
+      avatar: icon == null
+          ? null
+          : Icon(
+              icon,
+              size: 16,
+              color: highlight ? scheme.onErrorContainer : null,
+            ),
+      label: Text(
+        label,
+        style: highlight ? TextStyle(color: scheme.onErrorContainer) : null,
+      ),
+      backgroundColor: highlight ? scheme.errorContainer : null,
+      padding: EdgeInsets.zero,
+    );
+  }
+}
+
+class _InventoryMessage extends StatelessWidget {
+  const _InventoryMessage({
+    required this.icon,
+    required this.title,
+    required this.message,
+    this.action,
+  });
+
+  final IconData icon;
+  final String title;
+  final String message;
+  final Widget? action;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 46, color: Theme.of(context).colorScheme.outline),
+            const SizedBox(height: 12),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 6),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+            if (action != null) ...[const SizedBox(height: 16), action!],
+          ],
+        ),
+      ),
+    );
+  }
+}
